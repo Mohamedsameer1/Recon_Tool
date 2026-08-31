@@ -221,7 +221,7 @@ class PassiveReconTool:
                 status = "LIVE" if status_code < 500 else "DEAD"
                 print(f"{subdomain:<40} {status_code:<15} {status:<10}")
         
-        print(f"\n[+] Total live subdomains: {len([s for _, sc in self.live_subdomains if sc > 0])}")
+        print(f"\n[+] Total live subdomains: {len([sc for _, sc in self.live_subdomains if sc > 0])}")
     
     def export_results(self, filename: str = "subdomains.json"):
         """Export results to JSON file"""

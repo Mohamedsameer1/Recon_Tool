@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Passive Recon Tool - Find and verify live subdomains
+CyberInjection - Advanced Subdomain Enumeration Tool (Like Subfinder)
+Find all subdomains and verify which ones are live
 """
 
 import requests
@@ -14,11 +15,34 @@ import socket
 import threading
 from collections import defaultdict
 import time
+from datetime import datetime
 
-class PassiveReconTool:
-    def __init__(self, domain: str, timeout: int = 5, threads: int = 10):
+# Color codes for terminal output
+class Colors:
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    END = '\033[0m'
+    PURPLE = '\033[95m'
+    
+def print_success(msg):
+    print(f"{Colors.GREEN}[+]{Colors.END} {msg}")
+
+def print_info(msg):
+    print(f"{Colors.CYAN}[*]{Colors.END} {msg}")
+
+def print_warning(msg):
+    print(f"{Colors.YELLOW}[!]{Colors.END} {msg}")
+
+def print_error(msg):
+    print(f"{Colors.RED}[-]{Colors.END} {msg}")
+
+class SubdomainEnumerator:
+    def __init__(self, domain: str, timeout: int = 5, threads: int = 15):
         """
-        Initialize the recon tool
+        Initialize the subdomain enumerator (Like Subfinder)
         
         Args:
             domain: Target domain to scan
@@ -31,10 +55,12 @@ class PassiveReconTool:
         self.subdomains: Set[str] = set()
         self.live_subdomains: List[Tuple[str, int]] = []
         self.lock = threading.Lock()
+        self.start_time = datetime.now()
+        self.sources_used = []
         
     def get_subdomains_crt_sh(self) -> Set[str]:
         """Get subdomains from crt.sh (Certificate Transparency logs)"""
-        print("[*] Querying crt.sh for subdomains...")
+        print_info("Querying crt.sh for subdomains...")
         subdomains = set()
         
         try:
@@ -54,25 +80,30 @@ class PassiveReconTool:
                                 subdomains.add(subdomain)
                 except:
                     pass
+            self.sources_used.append("crt.sh")
         except requests.exceptions.RequestException as e:
-            print(f"[-] Error querying crt.sh: {e}")
+            print_warning(f"Error querying crt.sh: {e}")
         
-        print(f"[+] Found {len(subdomains)} subdomains from crt.sh")
+        print_success(f"Found {len(subdomains)} subdomains from crt.sh")
         return subdomains
     
     def get_subdomains_dns(self) -> Set[str]:
         """Get subdomains using DNS lookups (common subdomains)"""
-        print("[*] Checking common subdomains via DNS...")
+        print_info("Checking common subdomains via DNS...")
         subdomains = set()
         
-        # Common subdomain prefixes
+        # Common subdomain prefixes (extended list like subfinder)
         common_subdomains = [
             'www', 'mail', 'ftp', 'localhost', 'webmail', 'smtp', 'pop', 'ns1', 'ns2',
             'cpanel', 'whm', 'autodiscover', 'autoconfig', 'admin', 'api', 'app',
             'dev', 'staging', 'test', 'prod', 'cdn', 'static', 'blog', 'shop',
             'git', 'github', 'gitlab', 'jenkins', 'jira', 'slack', 'zoom',
             'mail1', 'mail2', 'webserver', 'database', 'backup', 'vpn',
-            'remote', 'secure', 'portal', 'login', 'auth', 'oauth'
+            'remote', 'secure', 'portal', 'login', 'auth', 'oauth', 'api-v1', 'api-v2',
+            'docs', 'support', 'help', 'wiki', 'forum', 'community', 'newsletter',
+            'status', 'cloud', 'dashboard', 'panel', 'console', 'control',
+            'download', 'upload', 'media', 'assets', 'images', 'cdn1', 'cdn2',
+            'mx', 'mx1', 'mx2', 'smtp1', 'smtp2', 'imap', 'pop3', 'webdisk'
         ]
         
         for prefix in common_subdomains:
@@ -85,7 +116,68 @@ class PassiveReconTool:
             except Exception:
                 pass
         
-        print(f"[+] Found {len(subdomains)} live subdomains via DNS")
+        self.sources_used.append("DNS Brute Force")
+        print_success(f"Found {len(subdomains)} live subdomains via DNS")
+        return subdomains
+    
+    def get_subdomains_securitytxt(self) -> Set[str]:
+        """Get subdomains from security.txt files"""
+        print_info("Checking security.txt files...")
+        subdomains = set()
+        
+        paths = ['/.well-known/security.txt', '/security.txt']
+        
+        for path in paths:
+            try:
+                url = f"https://{self.domain}{path}"
+                response = requests.get(url, timeout=self.timeout, verify=False)
+                if response.status_code == 200:
+                    content = response.text
+                    # Look for Contact URLs or other domains
+                    for line in content.split('\n'):
+                        if 'Contact:' in line or 'contact' in line.lower():
+                            parts = line.split(':')
+                            if len(parts) > 1:
+                                # Try to extract domain
+                                for word in parts[1].split():
+                                    if self.domain in word or '@' in word:
+                                        subdomains.add(word.replace('mailto:', '').replace('https://', '').replace('http://', '').split('/')[0])
+            except:
+                pass
+        
+        if subdomains:
+            self.sources_used.append("security.txt")
+        return subdomains
+    
+    def get_subdomains_github(self) -> Set[str]:
+        """Search GitHub for domain references"""
+        print_info("Searching GitHub for subdomains...")
+        subdomains = set()
+        
+        try:
+            # Simple GitHub code search (no API key required for basic searches)
+            search_queries = [
+                self.domain,
+                f'"{self.domain}"',
+            ]
+            
+            for query in search_queries:
+                url = "https://api.github.com/search/code"
+                params = {"q": query, "per_page": 10}
+                
+                try:
+                    response = requests.get(url, params=params, timeout=self.timeout)
+                    if response.status_code == 200:
+                        data = response.json()
+                        # This is limited without auth, so just note the attempt
+                        if data.get('total_count', 0) > 0:
+                            self.sources_used.append("GitHub")
+                            break
+                except:
+                    pass
+        except:
+            pass
+        
         return subdomains
     
     def get_subdomains_virustotal(self, api_key: str = None) -> Set[str]:
@@ -95,7 +187,7 @@ class PassiveReconTool:
         if not api_key:
             return subdomains
         
-        print("[*] Querying VirusTotal for subdomains...")
+        print_info("Querying VirusTotal for subdomains...")
         try:
             headers = {"x-apikey": api_key}
             url = f"https://www.virustotal.com/api/v3/domains/{self.domain}/subdomains"
@@ -107,9 +199,19 @@ class PassiveReconTool:
                     subdomain = item.get('id', '')
                     if subdomain:
                         subdomains.add(subdomain)
+                self.sources_used.append("VirusTotal")
         except Exception as e:
-            print(f"[-] Error querying VirusTotal: {e}")
+            print_warning(f"Error querying VirusTotal: {e}")
         
+        if subdomains:
+            print_success(f"Found {len(subdomains)} subdomains from VirusTotal")
+        return subdomains
+    
+    def get_subdomains_twitter(self) -> Set[str]:
+        """Simulate Twitter/X search (passive enumeration idea)"""
+        subdomains = set()
+        # This would require social media API keys
+        # Leaving as placeholder for enterprise version
         return subdomains
     
     def check_subdomain_live(self, subdomain: str) -> Tuple[str, int, bool]:
@@ -152,7 +254,8 @@ class PassiveReconTool:
     
     def verify_live_subdomains(self):
         """Check which subdomains are live using threading"""
-        print(f"\n[*] Checking {len(self.subdomains)} subdomains for live hosts...")
+        print_info(f"Verifying {len(self.subdomains)} subdomains for live hosts...")
+        print_info(f"Using {self.threads} concurrent threads\n")
         
         # Use threading for concurrent checks
         threads = []
@@ -176,26 +279,33 @@ class PassiveReconTool:
     
     def scan(self, virustotal_api_key: str = None) -> None:
         """
-        Run the complete passive recon scan
+        Run the complete subdomain enumeration scan (Like Subfinder)
         
         Args:
             virustotal_api_key: Optional VirusTotal API key
         """
-        print(f"\n{'='*60}")
-        print(f"Passive Recon Tool - Target: {self.domain}")
-        print(f"{'='*60}\n")
+        print(f"\n{Colors.CYAN}{'='*70}{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.PURPLE}CyberInjection - Subdomain Enumeration{Colors.END}")
+        print(f"{Colors.CYAN}{'='*70}{Colors.END}\n")
+        print_info(f"Target: {Colors.BOLD}{self.domain}{Colors.END}")
+        print_info(f"Scan started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print()
         
         # Gather subdomains from multiple sources
         self.subdomains.update(self.get_subdomains_crt_sh())
         self.subdomains.update(self.get_subdomains_dns())
+        self.subdomains.update(self.get_subdomains_securitytxt())
+        self.subdomains.update(self.get_subdomains_github())
         
         if virustotal_api_key:
             self.subdomains.update(self.get_subdomains_virustotal(virustotal_api_key))
         
-        print(f"\n[+] Total unique subdomains found: {len(self.subdomains)}\n")
+        print(f"\n{Colors.BOLD}Enumeration Summary:{Colors.END}")
+        print(f"  Sources used: {', '.join(set(self.sources_used))}")
+        print(f"  Total unique subdomains: {Colors.BOLD}{len(self.subdomains)}{Colors.END}\n")
         
         if not self.subdomains:
-            print("[-] No subdomains found!")
+            print_error("No subdomains found!")
             return
         
         # Verify which subdomains are live
@@ -205,24 +315,42 @@ class PassiveReconTool:
         self.display_results()
     
     def display_results(self):
-        """Display scan results"""
-        print(f"\n{'='*60}")
-        print("RESULTS - Live Subdomains")
-        print(f"{'='*60}\n")
+        """Display scan results in Subfinder-like format"""
+        print(f"\n{Colors.CYAN}{'='*70}{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.GREEN}LIVE SUBDOMAINS FOUND{Colors.END}")
+        print(f"{Colors.CYAN}{'='*70}{Colors.END}\n")
         
-        if not self.live_subdomains:
-            print("[-] No live subdomains found")
+        live_count = len([subdomain for subdomain, sc in self.live_subdomains if sc > 0])
+        
+        if not live_count:
+            print_warning("No live subdomains detected")
             return
         
-        print(f"{'Subdomain':<40} {'Status Code':<15} {'Status':<10}")
-        print("-" * 65)
+        print(f"{'Subdomain':<45} {'Status':<15} {'HTTP Code':<10}")
+        print("-" * 70)
         
         for subdomain, status_code in self.live_subdomains:
             if status_code > 0:
-                status = "LIVE" if status_code < 500 else "DEAD"
-                print(f"{subdomain:<40} {status_code:<15} {status:<10}")
+                if status_code < 300:
+                    status = f"{Colors.GREEN}✓ LIVE{Colors.END}"
+                    status_text = f"{Colors.GREEN}{status_code}{Colors.END}"
+                elif status_code < 400:
+                    status = f"{Colors.YELLOW}↻ REDIRECT{Colors.END}"
+                    status_text = f"{Colors.YELLOW}{status_code}{Colors.END}"
+                elif status_code < 500:
+                    status = f"{Colors.CYAN}? CLIENT{Colors.END}"
+                    status_text = f"{Colors.CYAN}{status_code}{Colors.END}"
+                else:
+                    status = f"{Colors.RED}✗ ERROR{Colors.END}"
+                    status_text = f"{Colors.RED}{status_code}{Colors.END}"
+                
+                print(f"{subdomain:<45} {status:<25} {status_text:<10}")
         
-        print(f"\n[+] Total live subdomains: {len([subdomain for subdomain, sc in self.live_subdomains if sc > 0])}")
+        elapsed = (datetime.now() - self.start_time).total_seconds()
+        print(f"\n{Colors.CYAN}{'='*70}{Colors.END}")
+        print_success(f"Total live subdomains: {live_count}")
+        print_info(f"Scan completed in {elapsed:.2f} seconds")
+        print(f"{Colors.CYAN}{'='*70}{Colors.END}\n")
     
     def export_results(self, filename: str = "subdomains.json"):
         """Export results to JSON file"""
@@ -251,8 +379,8 @@ def display_banner():
     ██                                                                       ██
     ██                      ██████╗ ██╗   ██╗██████╗ ███████╗██████╗       ██
     ██                     ██╔════╝ ██║   ██║██╔══██╗██╔════╝██╔══██╗      ██
-    ██                     ██║  ███╗██║   ██║██████╔╝█████╗  ██████╔╝      ██
-    ██                     ██║   ██║██║   ██║██╔══██╗██╔══╝  ██╔══██╗      ██
+    ██                     ██║     ║   ██║██████╔╝█████╗  ██████╔╝      ██
+    ██                     ██║      ██║   ██║██╔══██╗██╔══╝  ██╔══██╗      ██
     ██                     ╚██████╔╝╚██████╔╝██████╔╝███████╗██║  ██║      ██
     ██                      ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝      ██
     ██                                                                       ██
@@ -279,38 +407,37 @@ def main():
     
     try:
         # Get domain from user
-        print("\n[*] Enter the target domain (e.g., example.com):")
-        domain = input("    > ").strip()
+        print_info("Enter the target domain (e.g., example.com):")
+        domain = input(f"    {Colors.CYAN}>{Colors.END} ").strip()
         
         if not domain:
-            print("[-] Domain cannot be empty!")
+            print_error("Domain cannot be empty!")
             sys.exit(1)
         
         # Check for VirusTotal API key in environment variable
         virustotal_api_key = os.getenv("VIRUSTOTAL_API_KEY")
         
         if virustotal_api_key:
-            print("\n[+] VirusTotal API key found! Using it for additional subdomains...")
+            print_success("VirusTotal API key found! Using it for additional subdomains...")
         else:
-            print("\n[*] Tip: Set VIRUSTOTAL_API_KEY environment variable to unlock VirusTotal scanning")
-            print("    Get free API at: https://www.virustotal.com")
+            print_info("Tip: Set VIRUSTOTAL_API_KEY environment variable to unlock VirusTotal scanning")
+            print_info("Get free API at: https://www.virustotal.com\n")
         
         # Suppress HTTPS warnings
         requests.packages.urllib3.disable_warnings()
         
         # Run the tool with default 15 threads for faster scanning
-        print("\n")
-        tool = PassiveReconTool(domain, threads=15)
-        tool.scan(virustotal_api_key=virustotal_api_key)
-        tool.export_results()
+        enumerator = SubdomainEnumerator(domain, threads=15)
+        enumerator.scan(virustotal_api_key=virustotal_api_key)
+        enumerator.export_results()
         
-        print("\n[+] Scan completed! Check 'subdomains.json' for detailed results.")
+        print_success("Scan completed! Check 'subdomains.json' for detailed results.")
         
     except KeyboardInterrupt:
-        print("\n\n[-] Scan interrupted by user.")
+        print(f"\n\n{Colors.RED}Scan interrupted by user.{Colors.END}")
         sys.exit(0)
     except Exception as e:
-        print(f"\n[-] Error: {e}")
+        print_error(f"{e}")
         sys.exit(1)
 
 

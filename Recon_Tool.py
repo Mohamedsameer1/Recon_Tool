@@ -1,548 +1,308 @@
 #!/usr/bin/env python3
 """
-CyberInjection - Advanced Subdomain Enumeration Tool (Like Subfinder)
-Find all subdomains and verify which ones are live
+subscan.py — Subdomain enumeration + HTTP status + open-port checker
+
+Usage:
+    python3 subscan.py -d example.com
+    python3 subscan.py -d example.com -w wordlist.txt
+    python3 subscan.py -d example.com -p 80,443,8080,8443 -o results.csv
+
+What it does:
+    1. Passive enumeration via crt.sh (certificate transparency logs)
+    2. Optional active enumeration via DNS brute force against a wordlist
+    3. Resolves each candidate subdomain (DNS A/AAAA lookup)
+    4. Checks HTTP/HTTPS status code for live subdomains
+    5. Checks a set of common ports for open/closed state (TCP connect scan)
+    6. Prints a summary table and optionally writes CSV
+
+Only use against domains/scopes you are authorized to test (your own
+infra, or an active bug bounty / pentest engagement scope).
 """
 
-import requests
-import subprocess
-import json
-import sys
-import os
-from typing import Set, List, Tuple
-from urllib.parse import urlparse
+import argparse
+import concurrent.futures
+import csv
 import socket
-import threading
-from collections import defaultdict
+import sys
 import time
-from datetime import datetime
+import urllib.request
+import json
+import re
 
-# Color codes for terminal output
-class Colors:
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
-    PURPLE = '\033[95m'
-    
-def print_success(msg):
-    print(f"{Colors.GREEN}[+]{Colors.END} {msg}")
+DEFAULT_PORTS = [21, 22, 25, 80, 443, 8000, 8080, 8443, 3000, 3306]
+CRTSH_URL = "https://crt.sh/?q=%25.{domain}&output=json"
+OTX_URL = "https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns"
+HACKERTARGET_URL = "https://api.hackertarget.com/hostsearch/?q={domain}"
+HTTP_TIMEOUT = 5
+PORT_TIMEOUT = 2
 
-def print_info(msg):
-    print(f"{Colors.CYAN}[*]{Colors.END} {msg}")
 
-def print_warning(msg):
-    print(f"{Colors.YELLOW}[!]{Colors.END} {msg}")
+def _clean_name(name, domain):
+    name = name.strip().lower()
+    if name.startswith("*."):
+        name = name[2:]
+    if name.endswith(domain) and re.match(r"^[a-z0-9.\-_]+$", name):
+        return name
+    return None
 
-def print_error(msg):
-    print(f"{Colors.RED}[-]{Colors.END} {msg}")
 
-class SubdomainEnumerator:
-    def __init__(self, domain: str, timeout: int = 5, threads: int = 15):
-        """
-        Initialize the subdomain enumerator (Like Subfinder)
-        
-        Args:
-            domain: Target domain to scan
-            timeout: Request timeout in seconds
-            threads: Number of concurrent threads for checking live hosts
-        """
-        self.domain = domain
-        self.timeout = timeout
-        self.threads = threads
-        self.subdomains: Set[str] = set()
-        self.live_subdomains: List[Tuple[str, int]] = []
-        self.lock = threading.Lock()
-        self.start_time = datetime.now()
-        self.sources_used = []
-        
-    def get_subdomains_crt_sh(self) -> Set[str]:
-        """Get subdomains from crt.sh (Certificate Transparency logs)"""
-        print_info("Querying crt.sh for subdomains...")
-        subdomains = set()
-        
+def get_subdomains_crtsh(domain, retries=3, timeout=30):
+    """Passive enumeration via crt.sh certificate transparency logs.
+    crt.sh is notoriously slow/flaky, so retry with backoff before giving up."""
+    subs = set()
+    url = CRTSH_URL.format(domain=domain)
+    for attempt in range(1, retries + 1):
         try:
-            # Query crt.sh API for certificate transparency logs
-            url = f"https://crt.sh/?q=%.{self.domain}&output=json"
-            response = requests.get(url, timeout=self.timeout)
-            
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    for entry in data:
-                        name_value = entry.get('name_value', '')
-                        # Extract domains from name_value (can contain multiple domains)
-                        for subdomain in name_value.split('\n'):
-                            subdomain = subdomain.strip()
-                            if subdomain and self.domain in subdomain:
-                                subdomains.add(subdomain)
-                except:
-                    pass
-            self.sources_used.append("crt.sh")
-        except requests.exceptions.RequestException as e:
-            print_warning(f"Error querying crt.sh: {e}")
-        
-        print_success(f"Found {len(subdomains)} subdomains from crt.sh")
-        return subdomains
-    
-    def get_subdomains_dns(self) -> Set[str]:
-        """Get subdomains using DNS lookups (common subdomains)"""
-        print_info("Checking common subdomains via DNS...")
-        subdomains = set()
-        
-        # Common subdomain prefixes (extended list like subfinder)
-        common_subdomains = [
-            'www', 'mail', 'ftp', 'localhost', 'webmail', 'smtp', 'pop', 'ns1', 'ns2', 'ns3',
-            'cpanel', 'whm', 'autodiscover', 'autoconfig', 'admin', 'api', 'app',
-            'dev', 'staging', 'test', 'prod', 'cdn', 'static', 'blog', 'shop',
-            'git', 'github', 'gitlab', 'jenkins', 'jira', 'slack', 'zoom',
-            'mail1', 'mail2', 'mail3', 'webserver', 'database', 'backup', 'vpn',
-            'remote', 'secure', 'portal', 'login', 'auth', 'oauth', 'api-v1', 'api-v2',
-            'docs', 'support', 'help', 'wiki', 'forum', 'community', 'newsletter',
-            'status', 'cloud', 'dashboard', 'panel', 'console', 'control',
-            'download', 'upload', 'media', 'assets', 'images', 'cdn1', 'cdn2', 'cdn3',
-            'mx', 'mx1', 'mx2', 'smtp1', 'smtp2', 'imap', 'pop3', 'webdisk',
-            'b2b', 'b2c', 'admin-panel', 'cpanel-login', 'dev-api', 'staging-api',
-            'old', 'legacy', 'archive', 'beta', 'alpha', 'rc', 'sandbox',
-            'internal', 'intranet', 'employee', 'partner', 'reseller',
-            'service', 'services', 'application', 'software', 'platform',
-            'mobile', 'android', 'ios', 'app-store', 'play-store',
-            'payment', 'billing', 'invoice', 'finance', 'accounting',
-            'hr', 'human-resources', 'hr-portal', 'employee-portal',
-            'security', 'cert', 'certificate', 'ssl', 'tls',
-            'vpn-login', 'vpn-access', 'openvpn', 'wireguard'
-        ]
-        
-        for prefix in common_subdomains:
-            subdomain = f"{prefix}.{self.domain}"
-            try:
-                # Use nslookup/dig for better DNS resolution
-                if sys.platform == 'win32':
-                    result = subprocess.run(['nslookup', subdomain], capture_output=True, timeout=2)
-                else:
-                    result = subprocess.run(['dig', '+short', subdomain], capture_output=True, timeout=2)
-                
-                if result.returncode == 0 and result.stdout:
-                    output = result.stdout.decode('utf-8', errors='ignore').strip()
-                    if output and 'NXDOMAIN' not in output and 'cannot find' not in output.lower():
-                        subdomains.add(subdomain)
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                # Fallback to socket if dig/nslookup not available
-                try:
-                    socket.gethostbyname(subdomain)
-                    subdomains.add(subdomain)
-                except (socket.gaierror, socket.timeout):
-                    pass
-            except Exception:
-                pass
-        
-        self.sources_used.append("DNS Brute Force")
-        print_success(f"Found {len(subdomains)} live subdomains via DNS")
-        return subdomains
-    
-    def get_subdomains_securitytxt(self) -> Set[str]:
-        """Get subdomains from security.txt files"""
-        print_info("Checking security.txt files...")
-        subdomains = set()
-        
-        paths = ['/.well-known/security.txt', '/security.txt']
-        
-        for path in paths:
-            try:
-                url = f"https://{self.domain}{path}"
-                response = requests.get(url, timeout=self.timeout, verify=False)
-                if response.status_code == 200:
-                    content = response.text
-                    # Look for Contact URLs or other domains
-                    for line in content.split('\n'):
-                        if 'Contact:' in line or 'contact' in line.lower():
-                            parts = line.split(':')
-                            if len(parts) > 1:
-                                # Try to extract domain
-                                for word in parts[1].split():
-                                    if self.domain in word or '@' in word:
-                                        subdomains.add(word.replace('mailto:', '').replace('https://', '').replace('http://', '').split('/')[0])
-            except:
-                pass
-        
-        if subdomains:
-            self.sources_used.append("security.txt")
-        return subdomains
-    
-    def get_subdomains_urlscan(self) -> Set[str]:
-        """Get subdomains from URLScan.io"""
-        print_info("Searching URLScan.io for subdomains...")
-        subdomains = set()
-        
-        try:
-            url = "https://urlscan.io/api/v1/search/"
-            params = {"q": f"domain:{self.domain}"}
-            response = requests.get(url, params=params, timeout=self.timeout)
-            
-            if response.status_code == 200:
-                data = response.json()
-                for result in data.get('results', []):
-                    page_url = result.get('page', {}).get('url', '')
-                    if page_url:
-                        from urllib.parse import urlparse
-                        parsed = urlparse(page_url)
-                        subdomain = parsed.netloc
-                        if self.domain in subdomain:
-                            subdomains.add(subdomain)
-                if subdomains:
-                    self.sources_used.append("URLScan.io")
-        except:
-            pass
-        
-        return subdomains
-    
-    def get_subdomains_otx(self) -> Set[str]:
-        """Get subdomains from AlienVault OTX"""
-        print_info("Searching AlienVault OTX for subdomains...")
-        subdomains = set()
-        
-        try:
-            url = f"https://otx.alienvault.com/api/v1/domain/{self.domain}/subdomains"
-            response = requests.get(url, timeout=self.timeout)
-            
-            if response.status_code == 200:
-                data = response.json()
-                for subdomain in data.get('subdomains', []):
-                    full_domain = f"{subdomain}.{self.domain}"
-                    subdomains.add(full_domain)
-                if subdomains:
-                    self.sources_used.append("AlienVault OTX")
-        except:
-            pass
-        
-        return subdomains
-    
-    def get_subdomains_github(self) -> Set[str]:
-        """Search GitHub for domain references"""
-        print_info("Searching GitHub for subdomains...")
-        subdomains = set()
-        
-        try:
-            # Search for patterns in GitHub
-            search_patterns = [
-                f'*.{self.domain}',
-                self.domain,
-            ]
-            
-            for pattern in search_patterns:
-                url = "https://api.github.com/search/code"
-                params = {"q": pattern, "per_page": 5}
-                headers = {"Accept": "application/vnd.github.v3+json"}
-                
-                try:
-                    response = requests.get(url, params=params, headers=headers, timeout=self.timeout)
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data.get('total_count', 0) > 0:
-                            self.sources_used.append("GitHub")
-                            break
-                except:
-                    pass
-        except:
-            pass
-        
-        return subdomains
-    
-    def get_subdomains_virustotal(self, api_key: str = None) -> Set[str]:
-        """Get subdomains from VirusTotal (requires API key)"""
-        subdomains = set()
-        
-        if not api_key:
-            return subdomains
-        
-        print_info("Querying VirusTotal for subdomains...")
-        try:
-            headers = {"x-apikey": api_key}
-            url = f"https://www.virustotal.com/api/v3/domains/{self.domain}/subdomains"
-            response = requests.get(url, headers=headers, timeout=self.timeout)
-            
-            if response.status_code == 200:
-                data = response.json()
-                for item in data.get('data', []):
-                    subdomain = item.get('id', '')
-                    if subdomain:
-                        subdomains.add(subdomain)
-                self.sources_used.append("VirusTotal")
+            req = urllib.request.Request(url, headers={"User-Agent": "subscan/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read().decode("utf-8", errors="ignore")
+            entries = json.loads(data)
+            for entry in entries:
+                for name in entry.get("name_value", "").split("\n"):
+                    clean = _clean_name(name, domain)
+                    if clean:
+                        subs.add(clean)
+            return subs  # success
         except Exception as e:
-            print_warning(f"Error querying VirusTotal: {e}")
-        
-        if subdomains:
-            print_success(f"Found {len(subdomains)} subdomains from VirusTotal")
-        return subdomains
-    
-    def get_subdomains_twitter(self) -> Set[str]:
-        """Simulate Twitter/X search (passive enumeration idea)"""
-        subdomains = set()
-        # This would require social media API keys
-        # Leaving as placeholder for enterprise version
-        return subdomains
-    
-    def check_subdomain_live(self, subdomain: str) -> Tuple[str, int, bool]:
-        """
-        Check if a subdomain is live using DNS + HTTP verification
-        
-        Args:
-            subdomain: Subdomain to check
-            
-        Returns:
-            Tuple of (subdomain, status_code, is_live)
-        """
-        # First, verify DNS resolution
-        dns_resolves = False
+            print(f"[!] crt.sh attempt {attempt}/{retries} failed: {e}", file=sys.stderr)
+            if attempt < retries:
+                time.sleep(2 * attempt)
+    return subs
+
+
+def get_subdomains_otx(domain, timeout=15):
+    """Passive enumeration via AlienVault OTX passive DNS."""
+    subs = set()
+    url = OTX_URL.format(domain=domain)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "subscan/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        for record in data.get("passive_dns", []):
+            clean = _clean_name(record.get("hostname", ""), domain)
+            if clean:
+                subs.add(clean)
+    except Exception as e:
+        print(f"[!] OTX lookup failed: {e}", file=sys.stderr)
+    return subs
+
+
+def get_subdomains_hackertarget(domain, timeout=15):
+    """Passive enumeration via HackerTarget's free hostsearch API."""
+    subs = set()
+    url = HACKERTARGET_URL.format(domain=domain)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "subscan/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="ignore")
+        if "API count exceeded" in data or "error" in data.lower():
+            return subs
+        for line in data.splitlines():
+            host = line.split(",")[0]
+            clean = _clean_name(host, domain)
+            if clean:
+                subs.add(clean)
+    except Exception as e:
+        print(f"[!] HackerTarget lookup failed: {e}", file=sys.stderr)
+    return subs
+
+
+def get_subdomains_subfinder(domain, timeout=120):
+    """Shell out to subfinder if it's installed — usually the most reliable source."""
+    import subprocess
+    subs = set()
+    try:
+        result = subprocess.run(
+            ["subfinder", "-d", domain, "-silent"],
+            capture_output=True, text=True, timeout=timeout
+        )
+        for line in result.stdout.splitlines():
+            clean = _clean_name(line, domain)
+            if clean:
+                subs.add(clean)
+    except FileNotFoundError:
+        print("[!] subfinder not found on PATH — skipping (install it or drop -s)", file=sys.stderr)
+    except Exception as e:
+        print(f"[!] subfinder run failed: {e}", file=sys.stderr)
+    return subs
+
+
+def get_subdomains_bruteforce(domain, wordlist_path):
+    """Active enumeration: try each word as a subdomain and see if it resolves."""
+    candidates = set()
+    try:
+        with open(wordlist_path) as f:
+            words = [w.strip() for w in f if w.strip() and not w.startswith("#")]
+    except OSError as e:
+        print(f"[!] Could not read wordlist: {e}", file=sys.stderr)
+        return candidates
+
+    def try_word(word):
+        fqdn = f"{word}.{domain}"
         try:
-            # Try using subprocess for better DNS check
-            if sys.platform == 'win32':
-                result = subprocess.run(['nslookup', subdomain], capture_output=True, timeout=2)
-            else:
-                result = subprocess.run(['dig', '+short', subdomain], capture_output=True, timeout=2)
-            
-            if result.returncode == 0 and result.stdout:
-                output = result.stdout.decode('utf-8', errors='ignore').strip()
-                if output and 'NXDOMAIN' not in output and 'cannot find' not in output.lower():
-                    dns_resolves = True
-        except:
-            # Fallback to socket
-            try:
-                socket.gethostbyname(subdomain)
-                dns_resolves = True
-            except:
-                pass
-        
-        # If DNS doesn't resolve, mark as dead but still try HTTP
-        status_code = 0
-        
-        # Try HTTPS first, then HTTP
-        for protocol in ['https', 'http']:
-            url = f"{protocol}://{subdomain}"
-            try:
-                response = requests.head(
-                    url,
-                    timeout=self.timeout,
-                    allow_redirects=True,
-                    verify=False,
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-                )
-                status_code = response.status_code
-                
-                # Consider 2xx, 3xx, 4xx as "live" (server is responding)
-                is_live = status_code < 500
-                
-                with self.lock:
-                    # Only add if we got a valid response or DNS resolved
-                    if dns_resolves or (status_code > 0 and status_code < 600):
-                        self.live_subdomains.append((subdomain, status_code))
-                
-                return subdomain, status_code, is_live
-            except requests.exceptions.Timeout:
-                continue
-            except requests.exceptions.ConnectionError:
-                continue
-            except Exception:
-                continue
-        
-        # If HTTP failed but DNS resolved, add with 0 status
-        if dns_resolves:
-            with self.lock:
-                self.live_subdomains.append((subdomain, status_code))
-        
-        return subdomain, status_code, False
-    
-    def verify_live_subdomains(self):
-        """Check which subdomains are live using threading"""
-        print_info(f"Verifying {len(self.subdomains)} subdomains for live hosts...")
-        print_info(f"Using {self.threads} concurrent threads\n")
-        
-        # Use threading for concurrent checks
-        threads = []
-        subdomain_list = list(self.subdomains)
-        
-        for subdomain in subdomain_list:
-            while len(threading.enumerate()) > self.threads + 1:
-                time.sleep(0.1)
-            
-            thread = threading.Thread(target=self.check_subdomain_live, args=(subdomain,))
-            thread.daemon = True
-            thread.start()
-            threads.append(thread)
-        
-        # Wait for all threads to complete
-        for thread in threads:
-            thread.join()
-        
-        # Sort by status code
-        self.live_subdomains.sort(key=lambda x: x[1])
-    
-    def scan(self, virustotal_api_key: str = None) -> None:
-        """
-        Run the complete subdomain enumeration scan (Like Subfinder)
-        
-        Args:
-            virustotal_api_key: Optional VirusTotal API key
-        """
-        print(f"\n{Colors.CYAN}{'='*70}{Colors.END}")
-        print(f"{Colors.BOLD}{Colors.PURPLE}CyberInjection - Subdomain Enumeration{Colors.END}")
-        print(f"{Colors.CYAN}{'='*70}{Colors.END}\n")
-        print_info(f"Target: {Colors.BOLD}{self.domain}{Colors.END}")
-        print_info(f"Scan started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print()
-        
-        # Gather subdomains from multiple sources
-        self.subdomains.update(self.get_subdomains_crt_sh())
-        self.subdomains.update(self.get_subdomains_dns())
-        self.subdomains.update(self.get_subdomains_otx())
-        self.subdomains.update(self.get_subdomains_urlscan())
-        self.subdomains.update(self.get_subdomains_securitytxt())
-        self.subdomains.update(self.get_subdomains_github())
-        
-        if virustotal_api_key:
-            self.subdomains.update(self.get_subdomains_virustotal(virustotal_api_key))
-        
-        print(f"\n{Colors.BOLD}Enumeration Summary:{Colors.END}")
-        print(f"  Sources used: {', '.join(set(self.sources_used))}")
-        print(f"  Total unique subdomains: {Colors.BOLD}{len(self.subdomains)}{Colors.END}\n")
-        
-        if not self.subdomains:
-            print_error("No subdomains found!")
-            return
-        
-        # Verify which subdomains are live
-        self.verify_live_subdomains()
-        
-        # Display results
-        self.display_results()
-    
-    def display_results(self):
-        """Display scan results in Subfinder-like format"""
-        print(f"\n{Colors.CYAN}{'='*70}{Colors.END}")
-        print(f"{Colors.BOLD}{Colors.GREEN}LIVE SUBDOMAINS FOUND{Colors.END}")
-        print(f"{Colors.CYAN}{'='*70}{Colors.END}\n")
-        
-        live_count = len([subdomain for subdomain, sc in self.live_subdomains if sc > 0])
-        
-        if not live_count:
-            print_warning("No live subdomains detected")
-            return
-        
-        print(f"{'Subdomain':<45} {'Status':<15} {'HTTP Code':<10}")
-        print("-" * 70)
-        
-        for subdomain, status_code in self.live_subdomains:
-            if status_code > 0:
-                if status_code < 300:
-                    status = f"{Colors.GREEN}✓ LIVE{Colors.END}"
-                    status_text = f"{Colors.GREEN}{status_code}{Colors.END}"
-                elif status_code < 400:
-                    status = f"{Colors.YELLOW}↻ REDIRECT{Colors.END}"
-                    status_text = f"{Colors.YELLOW}{status_code}{Colors.END}"
-                elif status_code < 500:
-                    status = f"{Colors.CYAN}? CLIENT{Colors.END}"
-                    status_text = f"{Colors.CYAN}{status_code}{Colors.END}"
-                else:
-                    status = f"{Colors.RED}✗ ERROR{Colors.END}"
-                    status_text = f"{Colors.RED}{status_code}{Colors.END}"
-                
-                print(f"{subdomain:<45} {status:<25} {status_text:<10}")
-        
-        elapsed = (datetime.now() - self.start_time).total_seconds()
-        print(f"\n{Colors.CYAN}{'='*70}{Colors.END}")
-        print_success(f"Total live subdomains: {live_count}")
-        print_info(f"Scan completed in {elapsed:.2f} seconds")
-        print(f"{Colors.CYAN}{'='*70}{Colors.END}\n")
-    
-    def export_results(self, filename: str = "subdomains.json"):
-        """Export results to JSON file"""
-        results = {
-            "domain": self.domain,
-            "total_subdomains": len(self.subdomains),
-            "live_subdomains": [
-                {"subdomain": subdomain, "status_code": status_code}
-                for subdomain, status_code in self.live_subdomains
-                if status_code > 0
-            ]
-        }
-        
-        with open(filename, 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        print(f"\n[+] Results exported to {filename}")
+            socket.gethostbyname(fqdn)
+            return fqdn
+        except socket.error:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
+        for result in ex.map(try_word, words):
+            if result:
+                candidates.add(result)
+    return candidates
 
 
-def display_banner():
-    """Display tool banner with name"""
-    banner = """
-    
-    ███████████████████████████████████████████████████████████████████████████
-    ███████████████████████████████████████████████████████████████████████████
-    ██                                                                       ██
-    ██                      ██████╗ ██╗   ██╗██████╗ ███████╗██████╗       ██
-    ██                     ██╔════╝ ██║   ██║██╔══██╗██╔════╝██╔══██╗      ██
-    ██                     ██║     ║   ██║██████╔╝█████╗  ██████╔╝      ██
-    ██                     ██║      ██║   ██║██╔══██╗██╔══╝  ██╔══██╗      ██
-    ██                     ╚██████╔╝╚██████╔╝██████╔╝███████╗██║  ██║      ██
-    ██                      ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝      ██
-    ██                                                                       ██
-    ██          ██╗███╗   ██╗███████╗███████╗ ██████╗████████╗██╗ ██████╗  ██
-    ██          ██║████╗  ██║██╔════╝██╔════╝██╔════╝╚══██╔══╝██║██╔═══██╗ ██
-    ██          ██║██╔██╗ ██║█████╗  █████╗  ██║        ██║   ██║██║   ██║ ██
-    ██          ██║██║╚██╗██║██╔══╝  ██╔══╝  ██║        ██║   ██║██║   ██║ ██
-    ██          ██║██║ ╚████║███████╗███████╗╚██████╗   ██║   ██║╚██████╔╝ ██
-    ██          ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝ ╚═════╝   ╚═╝   ╚═╝ ╚═════╝  ██
-    ██                                                                       ██
-    ██              Passive Reconnaissance Tool v1.0                        ██
-    ██          Find & Verify Live Subdomains                              ██
-    ██                                                                       ██
-    ███████████████████████████████████████████████████████████████████████████
-    ███████████████████████████████████████████████████████████████████████████
-    """
-    print(banner)
+def resolve(sub):
+    try:
+        ip = socket.gethostbyname(sub)
+        return sub, ip
+    except socket.error:
+        return sub, None
+
+
+def check_http(sub):
+    """Return (scheme, status_code) for the first scheme that responds, else (None, None)."""
+    for scheme in ("https", "http"):
+        url = f"{scheme}://{sub}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "subscan/1.0"}, method="GET")
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                return scheme, resp.status
+        except urllib.error.HTTPError as e:
+            # Still a valid response (e.g. 403/404) — the host is alive
+            return scheme, e.code
+        except Exception:
+            continue
+    return None, None
+
+
+def check_ports(ip, ports):
+    open_ports = []
+    for port in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(PORT_TIMEOUT)
+        try:
+            result = s.connect_ex((ip, port))
+            if result == 0:
+                open_ports.append(port)
+        except socket.error:
+            pass
+        finally:
+            s.close()
+    return open_ports
+
+
+def scan_target(sub, ports):
+    sub, ip = resolve(sub)
+    if not ip:
+        return {"subdomain": sub, "ip": None, "status": "NO_DNS", "http_status": None, "open_ports": []}
+    scheme, code = check_http(sub)
+    open_ports = check_ports(ip, ports)
+    return {
+        "subdomain": sub,
+        "ip": ip,
+        "status": "UP" if (code or open_ports) else "DOWN",
+        "http_status": f"{scheme.upper()} {code}" if code else "-",
+        "open_ports": open_ports,
+    }
 
 
 def main():
-    """Main function with interactive input"""
-    # Display banner
-    display_banner()
-    
-    try:
-        # Get domain from user
-        print_info("Enter the target domain (e.g., example.com):")
-        domain = input(f"    {Colors.CYAN}>{Colors.END} ").strip()
-        
-        if not domain:
-            print_error("Domain cannot be empty!")
-            sys.exit(1)
-        
-        # Check for VirusTotal API key in environment variable
-        virustotal_api_key = os.getenv("VIRUSTOTAL_API_KEY")
-        
-        if virustotal_api_key:
-            print_success("VirusTotal API key found! Using it for additional subdomains...")
-        else:
-            print_info("Tip: Set VIRUSTOTAL_API_KEY environment variable to unlock VirusTotal scanning")
-            print_info("Get free API at: https://www.virustotal.com\n")
-        
-        # Suppress HTTPS warnings
-        requests.packages.urllib3.disable_warnings()
-        
-        # Run the tool with default 15 threads for faster scanning
-        enumerator = SubdomainEnumerator(domain, threads=15)
-        enumerator.scan(virustotal_api_key=virustotal_api_key)
-        enumerator.export_results()
-        
-        print_success("Scan completed! Check 'subdomains.json' for detailed results.")
-        
-    except KeyboardInterrupt:
-        print(f"\n\n{Colors.RED}Scan interrupted by user.{Colors.END}")
-        sys.exit(0)
-    except Exception as e:
-        print_error(f"{e}")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Subdomain enumeration + status/port checker")
+    parser.add_argument("-d", "--domain", required=True, help="Target root domain, e.g. example.com")
+    parser.add_argument("-w", "--wordlist", help="Optional wordlist for active DNS brute force")
+    parser.add_argument("-p", "--ports", help="Comma-separated ports to check (default: common set)")
+    parser.add_argument("-o", "--output", help="Write results to this CSV file")
+    parser.add_argument("-t", "--threads", type=int, default=30, help="Concurrent workers (default 30)")
+    parser.add_argument("-s", "--subfinder", action="store_true",
+                         help="Also run subfinder (if installed) and merge its results — recommended")
+    parser.add_argument("--no-crtsh", action="store_true", help="Skip crt.sh (useful if it's timing out for you)")
+    args = parser.parse_args()
+
+    ports = DEFAULT_PORTS
+    if args.ports:
+        ports = [int(p.strip()) for p in args.ports.split(",") if p.strip()]
+
+    banner = r"""
+   _____      _              _____       _           _   _
+  / ____|    | |            |_   _|     (_)         | | (_)
+ | |    _   _| |__   ___ _ __ | | _ __  _  ___  ___| |_ _  ___  _ __
+ | |   | | | | '_ \ / _ \ '__|| || '_ \| |/ _ \/ __| __| |/ _ \| '_ \
+ | |___| |_| | |_) |  __/ |  _| || | | | |  __/ (__| |_| | (_) | | | |
+  \_____\__, |_.__/ \___|_| |_____|_| |_|_|\___|\___|\__|_|\___/|_| |_|
+         __/ |
+        |___/
+                    by CyberInjection
+                created by Muhamed Sameer
+"""
+    print(banner)
+
+    domain = args.domain.lower().strip()
+    print(f"[*] Enumerating subdomains for {domain} ...")
+
+    subs = {domain}
+
+    if not args.no_crtsh:
+        crtsh_subs = get_subdomains_crtsh(domain)
+        print(f"[*] crt.sh returned {len(crtsh_subs)} candidate(s)")
+        subs |= crtsh_subs
+
+    otx_subs = get_subdomains_otx(domain)
+    print(f"[*] AlienVault OTX returned {len(otx_subs)} candidate(s)")
+    subs |= otx_subs
+
+    ht_subs = get_subdomains_hackertarget(domain)
+    print(f"[*] HackerTarget returned {len(ht_subs)} candidate(s)")
+    subs |= ht_subs
+
+    if args.subfinder:
+        print("[*] Running subfinder ...")
+        sf_subs = get_subdomains_subfinder(domain)
+        print(f"[*] subfinder returned {len(sf_subs)} candidate(s)")
+        subs |= sf_subs
+
+    if args.wordlist:
+        print(f"[*] Brute-forcing with wordlist: {args.wordlist}")
+        brute = get_subdomains_bruteforce(domain, args.wordlist)
+        print(f"[*] Brute force resolved {len(brute)} additional candidate(s)")
+        subs |= brute
+
+    subs = sorted(subs)
+    print(f"[*] Total unique candidates: {len(subs)}")
+    print(f"[*] Checking DNS / HTTP status / ports {ports} ...\n")
+
+    results = []
+    start = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+        futures = {ex.submit(scan_target, s, ports): s for s in subs}
+        for fut in concurrent.futures.as_completed(futures):
+            results.append(fut.result())
+
+    results.sort(key=lambda r: (r["status"] != "UP", r["subdomain"]))
+
+    print(f"{'SUBDOMAIN':40} {'IP':16} {'STATUS':8} {'HTTP':14} OPEN PORTS")
+    print("-" * 100)
+    up_count = 0
+    for r in results:
+        if r["status"] == "UP":
+            up_count += 1
+        ports_str = ",".join(str(p) for p in r["open_ports"]) if r["open_ports"] else "-"
+        ip_str = r["ip"] or "-"
+        print(f"{r['subdomain']:40} {ip_str:16} {r['status']:8} {str(r['http_status']):14} {ports_str}")
+
+    elapsed = time.time() - start
+    print("-" * 100)
+    print(f"[*] Done in {elapsed:.1f}s — {up_count}/{len(results)} hosts UP")
+
+    if args.output:
+        with open(args.output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["subdomain", "ip", "status", "http_status", "open_ports"])
+            writer.writeheader()
+            for r in results:
+                row = dict(r)
+                row["open_ports"] = ";".join(str(p) for p in r["open_ports"])
+                writer.writerow(row)
+        print(f"[*] Results written to {args.output}")
 
 
 if __name__ == "__main__":

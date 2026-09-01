@@ -1,132 +1,61 @@
-# CyberInjection - Passive Reconnaissance Tool
+# subscan
 
-A Python tool to find all subdomains of a target domain and check which ones are live/active.
+Subdomain enumeration + HTTP status + open-port checker.
 
-## Features
+Created by **Muhamed Sameer** ([CyberInjection]([https://github.com/](https://github.com/Mohamedsameer1))).
 
-- **Certificate Transparency (crt.sh)**: Queries certificate transparency logs for discovered subdomains
-- **DNS Enumeration**: Tests common subdomain prefixes using DNS resolution
-- **VirusTotal Integration**: Optional integration with VirusTotal API for additional subdomain discovery
-- **Live Host Detection**: Checks HTTP/HTTPS status codes to determine which subdomains are active
-- **Multi-threaded**: Uses concurrent threads for faster verification
-- **JSON Export**: Exports results to a JSON file for further analysis
-- **Cross-platform**: Works on Linux, macOS, and Windows
-- **Interactive Interface**: Simple command-line prompts for easy use
+## What it does
 
-## Installation
+1. **Passive enumeration** — pulls subdomains from crt.sh (certificate transparency), AlienVault OTX passive DNS, and HackerTarget's hostsearch API
+2. **Active enumeration (optional)** — DNS brute force against a wordlist you supply
+3. **subfinder integration (optional)** — merges in results from [subfinder](https://github.com/projectdiscovery/subfinder) if it's installed
+4. **DNS resolution** — filters candidates down to ones that actually resolve
+5. **HTTP status check** — hits each live host over HTTPS/HTTP and records the response code
+6. **Port scan** — TCP connect scan against a configurable port list
+7. **Output** — sorted table in the terminal, optional CSV export
 
-```bash
-# Clone or navigate to the tool directory
-cd /path/to/CyberInjection
+## Requirements
 
-# Install dependencies
-pip install -r requirements.txt
-```
+- Python 3.8+
+- No third-party Python packages required (standard library only)
+- Optional: [subfinder](https://github.com/projectdiscovery/subfinder) on your `PATH` if you want to use `-s`
 
 ## Usage
 
-Simply run the tool and follow the interactive prompts:
-
 ```bash
-python Recon_Tool.py
+# Basic run — passive sources only
+python3 subscan.py -d example.com
+
+# Include subfinder results
+python3 subscan.py -d example.com -s
+
+# Add active DNS brute force with a wordlist
+python3 subscan.py -d example.com -w wordlist.txt
+
+# Custom ports, save to CSV
+python3 subscan.py -d example.com -p 80,443,8080,8443 -o results.csv
+
+# Skip crt.sh (it can be slow/flaky) and rely on OTX + HackerTarget + subfinder
+python3 subscan.py -d example.com --no-crtsh -s
 ```
 
-The tool will ask you for:
-1. **Target domain** - The domain to scan (e.g., example.com)
-2. **Number of threads** - How many concurrent checks to run (default: 10, recommended: 10-50)
-3. **VirusTotal API key** - Optional additional subdomain source
+### Options
 
-### Example Session:
+| Flag | Description |
+|---|---|
+| `-d, --domain` | Target root domain (required) |
+| `-w, --wordlist` | Wordlist for active DNS brute force |
+| `-p, --ports` | Comma-separated ports to check (default: 21,22,25,80,443,8000,8080,8443,3000,3306) |
+| `-o, --output` | Write results to a CSV file |
+| `-t, --threads` | Concurrent worker threads (default: 30) |
+| `-s, --subfinder` | Also run subfinder and merge its results |
+| `--no-crtsh` | Skip crt.sh lookup |
 
-```
-╔══════════════════════════════════════════════════════════════╗
-║                                                              ║
-║                    CYBERINJECTION                           ║
-║              Passive Reconnaissance Tool v1.0               ║
-║                                                              ║
-║            Find & Verify Live Subdomains                   ║
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
+## Legal / scope notice
 
-[*] Enter the target domain (e.g., example.com):
-    > example.com
+This tool performs active reconnaissance (DNS brute force, HTTP requests, TCP port scans) against the domains you target. Only run it against:
 
-[*] Enter number of threads (default: 10, recommended: 10-50):
-    > 20
+- Infrastructure you own, or
+- Targets explicitly within scope of a bug bounty program or signed pentest engagement you're authorized for
 
-[*] Do you have a VirusTotal API key? (y/n, default: n):
-    > n
-```
-
-## How It Works
-
-1. **Subdomain Discovery**:
-   - Queries crt.sh for subdomains found in certificate transparency logs
-   - Tests common subdomain prefixes (www, mail, api, admin, etc.) via DNS
-   - Optionally queries VirusTotal for additional subdomains (requires API key)
-
-2. **Live Host Verification**:
-   - Makes HTTP/HTTPS requests to each discovered subdomain
-   - Records HTTP status codes
-   - Identifies "live" subdomains (status codes 2xx-4xx)
-   - Uses multi-threading for faster checks
-
-3. **Results**:
-   - Displays live subdomains in the terminal
-   - Exports results to `subdomains.json`
-
-## Output
-
-The tool displays:
-- Total subdomains discovered
-- Live subdomains with HTTP status codes
-- A JSON file with all results
-
-Example output:
-```
-============================================================
-RESULTS - Live Subdomains
-============================================================
-
-Subdomain                                Status Code     Status
-----------------------------------------
-api.example.com                          200             LIVE
-www.example.com                          301             LIVE
-admin.example.com                        404             LIVE
-dev.example.com                          0               DEAD
-
-[+] Total live subdomains: 3
-```
-
-## Notes
-
-- This is a **passive recon** tool - it doesn't actively scan targets aggressively
-- Requires an internet connection to query crt.sh and VirusTotal
-- VirusTotal API key is optional but provides additional subdomain sources
-- Common status codes:
-  - 2xx: Successful (resource found and accessible)
-  - 3xx: Redirect (resource exists but redirects)
-  - 4xx: Client error (page not found but server responds)
-  - 5xx: Server error (service is having issues)
-  - 0: No response (dead/unreachable)
-
-## Getting a VirusTotal API Key
-
-1. Visit https://www.virustotal.com
-2. Create a free account or sign in
-3. Go to your API key in account settings
-4. Use it with the tool when prompted
-
-## Security Notes
-
-- Only use this tool on systems you own or have explicit permission to scan
-- Respect legal and ethical guidelines for penetration testing
-- The tool does not perform active attacks or aggressive scans
-- Be mindful of rate limiting on public APIs
-
-## System Requirements
-
-- Python 3.6+
-- Linux, macOS, or Windows
-- Internet connection
-
+Scanning out-of-scope or unauthorized targets may violate computer misuse laws and bug bounty program terms.

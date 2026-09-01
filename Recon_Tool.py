@@ -7,6 +7,7 @@ import requests
 import subprocess
 import json
 import sys
+import os
 from typing import Set, List, Tuple
 from urllib.parse import urlparse
 import socket
@@ -221,7 +222,7 @@ class PassiveReconTool:
                 status = "LIVE" if status_code < 500 else "DEAD"
                 print(f"{subdomain:<40} {status_code:<15} {status:<10}")
         
-        print(f"\n[+] Total live subdomains: {len([s for _, sc in self.live_subdomains if sc > 0])}")
+        print(f"\n[+] Total live subdomains: {len([subdomain for subdomain, sc in self.live_subdomains if sc > 0])}")
     
     def export_results(self, filename: str = "subdomains.json"):
         """Export results to JSON file"""
@@ -285,34 +286,21 @@ def main():
             print("[-] Domain cannot be empty!")
             sys.exit(1)
         
-        # Get thread count
-        print("\n[*] Enter number of threads (default: 10, recommended: 10-50):")
-        threads_input = input("    > ").strip()
-        threads = 10
+        # Check for VirusTotal API key in environment variable
+        virustotal_api_key = os.getenv("VIRUSTOTAL_API_KEY")
         
-        if threads_input:
-            try:
-                threads = int(threads_input)
-                if threads < 1:
-                    threads = 10
-            except ValueError:
-                threads = 10
-        
-        # Get VirusTotal API key (optional)
-        print("\n[*] Do you have a VirusTotal API key? (y/n, default: n):")
-        has_api = input("    > ").strip().lower()
-        virustotal_api_key = None
-        
-        if has_api in ['y', 'yes']:
-            print("\n[*] Enter your VirusTotal API key:")
-            virustotal_api_key = input("    > ").strip()
+        if virustotal_api_key:
+            print("\n[+] VirusTotal API key found! Using it for additional subdomains...")
+        else:
+            print("\n[*] Tip: Set VIRUSTOTAL_API_KEY environment variable to unlock VirusTotal scanning")
+            print("    Get free API at: https://www.virustotal.com")
         
         # Suppress HTTPS warnings
         requests.packages.urllib3.disable_warnings()
         
-        # Run the tool
+        # Run the tool with default 15 threads for faster scanning
         print("\n")
-        tool = PassiveReconTool(domain, threads=threads)
+        tool = PassiveReconTool(domain, threads=15)
         tool.scan(virustotal_api_key=virustotal_api_key)
         tool.export_results()
         

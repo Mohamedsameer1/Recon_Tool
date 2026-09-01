@@ -1,2 +1,7 @@
-requests>=2.28.0
-urllib3>=1.26.0
+# subscan has no third-party Python dependencies — it only uses the
+# standard library (argparse, socket, urllib, json, csv, re,
+# concurrent.futures, subprocess).
+#
+# Optional external tool (not a pip package):
+#   subfinder — required only if you use the -s / --subfinder flag
+#   Install: https://github.com/projectdiscovery/subfinder#install

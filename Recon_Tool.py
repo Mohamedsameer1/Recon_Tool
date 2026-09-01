@@ -94,25 +94,47 @@ class SubdomainEnumerator:
         
         # Common subdomain prefixes (extended list like subfinder)
         common_subdomains = [
-            'www', 'mail', 'ftp', 'localhost', 'webmail', 'smtp', 'pop', 'ns1', 'ns2',
+            'www', 'mail', 'ftp', 'localhost', 'webmail', 'smtp', 'pop', 'ns1', 'ns2', 'ns3',
             'cpanel', 'whm', 'autodiscover', 'autoconfig', 'admin', 'api', 'app',
             'dev', 'staging', 'test', 'prod', 'cdn', 'static', 'blog', 'shop',
             'git', 'github', 'gitlab', 'jenkins', 'jira', 'slack', 'zoom',
-            'mail1', 'mail2', 'webserver', 'database', 'backup', 'vpn',
+            'mail1', 'mail2', 'mail3', 'webserver', 'database', 'backup', 'vpn',
             'remote', 'secure', 'portal', 'login', 'auth', 'oauth', 'api-v1', 'api-v2',
             'docs', 'support', 'help', 'wiki', 'forum', 'community', 'newsletter',
             'status', 'cloud', 'dashboard', 'panel', 'console', 'control',
-            'download', 'upload', 'media', 'assets', 'images', 'cdn1', 'cdn2',
-            'mx', 'mx1', 'mx2', 'smtp1', 'smtp2', 'imap', 'pop3', 'webdisk'
+            'download', 'upload', 'media', 'assets', 'images', 'cdn1', 'cdn2', 'cdn3',
+            'mx', 'mx1', 'mx2', 'smtp1', 'smtp2', 'imap', 'pop3', 'webdisk',
+            'b2b', 'b2c', 'admin-panel', 'cpanel-login', 'dev-api', 'staging-api',
+            'old', 'legacy', 'archive', 'beta', 'alpha', 'rc', 'sandbox',
+            'internal', 'intranet', 'employee', 'partner', 'reseller',
+            'service', 'services', 'application', 'software', 'platform',
+            'mobile', 'android', 'ios', 'app-store', 'play-store',
+            'payment', 'billing', 'invoice', 'finance', 'accounting',
+            'hr', 'human-resources', 'hr-portal', 'employee-portal',
+            'security', 'cert', 'certificate', 'ssl', 'tls',
+            'vpn-login', 'vpn-access', 'openvpn', 'wireguard'
         ]
         
         for prefix in common_subdomains:
             subdomain = f"{prefix}.{self.domain}"
             try:
-                socket.gethostbyname(subdomain)
-                subdomains.add(subdomain)
-            except socket.gaierror:
-                pass
+                # Use nslookup/dig for better DNS resolution
+                if sys.platform == 'win32':
+                    result = subprocess.run(['nslookup', subdomain], capture_output=True, timeout=2)
+                else:
+                    result = subprocess.run(['dig', '+short', subdomain], capture_output=True, timeout=2)
+                
+                if result.returncode == 0 and result.stdout:
+                    output = result.stdout.decode('utf-8', errors='ignore').strip()
+                    if output and 'NXDOMAIN' not in output and 'cannot find' not in output.lower():
+                        subdomains.add(subdomain)
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                # Fallback to socket if dig/nslookup not available
+                try:
+                    socket.gethostbyname(subdomain)
+                    subdomains.add(subdomain)
+                except (socket.gaierror, socket.timeout):
+                    pass
             except Exception:
                 pass
         
@@ -149,27 +171,75 @@ class SubdomainEnumerator:
             self.sources_used.append("security.txt")
         return subdomains
     
+    def get_subdomains_urlscan(self) -> Set[str]:
+        """Get subdomains from URLScan.io"""
+        print_info("Searching URLScan.io for subdomains...")
+        subdomains = set()
+        
+        try:
+            url = "https://urlscan.io/api/v1/search/"
+            params = {"q": f"domain:{self.domain}"}
+            response = requests.get(url, params=params, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                data = response.json()
+                for result in data.get('results', []):
+                    page_url = result.get('page', {}).get('url', '')
+                    if page_url:
+                        from urllib.parse import urlparse
+                        parsed = urlparse(page_url)
+                        subdomain = parsed.netloc
+                        if self.domain in subdomain:
+                            subdomains.add(subdomain)
+                if subdomains:
+                    self.sources_used.append("URLScan.io")
+        except:
+            pass
+        
+        return subdomains
+    
+    def get_subdomains_otx(self) -> Set[str]:
+        """Get subdomains from AlienVault OTX"""
+        print_info("Searching AlienVault OTX for subdomains...")
+        subdomains = set()
+        
+        try:
+            url = f"https://otx.alienvault.com/api/v1/domain/{self.domain}/subdomains"
+            response = requests.get(url, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                data = response.json()
+                for subdomain in data.get('subdomains', []):
+                    full_domain = f"{subdomain}.{self.domain}"
+                    subdomains.add(full_domain)
+                if subdomains:
+                    self.sources_used.append("AlienVault OTX")
+        except:
+            pass
+        
+        return subdomains
+    
     def get_subdomains_github(self) -> Set[str]:
         """Search GitHub for domain references"""
         print_info("Searching GitHub for subdomains...")
         subdomains = set()
         
         try:
-            # Simple GitHub code search (no API key required for basic searches)
-            search_queries = [
+            # Search for patterns in GitHub
+            search_patterns = [
+                f'*.{self.domain}',
                 self.domain,
-                f'"{self.domain}"',
             ]
             
-            for query in search_queries:
+            for pattern in search_patterns:
                 url = "https://api.github.com/search/code"
-                params = {"q": query, "per_page": 10}
+                params = {"q": pattern, "per_page": 5}
+                headers = {"Accept": "application/vnd.github.v3+json"}
                 
                 try:
-                    response = requests.get(url, params=params, timeout=self.timeout)
+                    response = requests.get(url, params=params, headers=headers, timeout=self.timeout)
                     if response.status_code == 200:
                         data = response.json()
-                        # This is limited without auth, so just note the attempt
                         if data.get('total_count', 0) > 0:
                             self.sources_used.append("GitHub")
                             break
@@ -216,7 +286,7 @@ class SubdomainEnumerator:
     
     def check_subdomain_live(self, subdomain: str) -> Tuple[str, int, bool]:
         """
-        Check if a subdomain is live
+        Check if a subdomain is live using DNS + HTTP verification
         
         Args:
             subdomain: Subdomain to check
@@ -224,6 +294,30 @@ class SubdomainEnumerator:
         Returns:
             Tuple of (subdomain, status_code, is_live)
         """
+        # First, verify DNS resolution
+        dns_resolves = False
+        try:
+            # Try using subprocess for better DNS check
+            if sys.platform == 'win32':
+                result = subprocess.run(['nslookup', subdomain], capture_output=True, timeout=2)
+            else:
+                result = subprocess.run(['dig', '+short', subdomain], capture_output=True, timeout=2)
+            
+            if result.returncode == 0 and result.stdout:
+                output = result.stdout.decode('utf-8', errors='ignore').strip()
+                if output and 'NXDOMAIN' not in output and 'cannot find' not in output.lower():
+                    dns_resolves = True
+        except:
+            # Fallback to socket
+            try:
+                socket.gethostbyname(subdomain)
+                dns_resolves = True
+            except:
+                pass
+        
+        # If DNS doesn't resolve, mark as dead but still try HTTP
+        status_code = 0
+        
         # Try HTTPS first, then HTTP
         for protocol in ['https', 'http']:
             url = f"{protocol}://{subdomain}"
@@ -232,7 +326,8 @@ class SubdomainEnumerator:
                     url,
                     timeout=self.timeout,
                     allow_redirects=True,
-                    verify=False
+                    verify=False,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
                 )
                 status_code = response.status_code
                 
@@ -240,7 +335,9 @@ class SubdomainEnumerator:
                 is_live = status_code < 500
                 
                 with self.lock:
-                    self.live_subdomains.append((subdomain, status_code))
+                    # Only add if we got a valid response or DNS resolved
+                    if dns_resolves or (status_code > 0 and status_code < 600):
+                        self.live_subdomains.append((subdomain, status_code))
                 
                 return subdomain, status_code, is_live
             except requests.exceptions.Timeout:
@@ -250,7 +347,12 @@ class SubdomainEnumerator:
             except Exception:
                 continue
         
-        return subdomain, 0, False
+        # If HTTP failed but DNS resolved, add with 0 status
+        if dns_resolves:
+            with self.lock:
+                self.live_subdomains.append((subdomain, status_code))
+        
+        return subdomain, status_code, False
     
     def verify_live_subdomains(self):
         """Check which subdomains are live using threading"""
@@ -294,6 +396,8 @@ class SubdomainEnumerator:
         # Gather subdomains from multiple sources
         self.subdomains.update(self.get_subdomains_crt_sh())
         self.subdomains.update(self.get_subdomains_dns())
+        self.subdomains.update(self.get_subdomains_otx())
+        self.subdomains.update(self.get_subdomains_urlscan())
         self.subdomains.update(self.get_subdomains_securitytxt())
         self.subdomains.update(self.get_subdomains_github())
         
